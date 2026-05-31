@@ -7,7 +7,6 @@ import logging
 from datetime import datetime, date
 from io import BytesIO
 import httpx
-import asyncio
 
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -22,8 +21,10 @@ from collections import defaultdict
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 DB_PATH = "expenses.db"
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -80,85 +81,49 @@ def get_daily_totals(chat_id: int, days: int = 30):
     con.close()
     return list(reversed(rows))
 
-# ─── CLAUDE HELPERS ─────────────────────────────────────────────────────────
-async def parse_text_with_claude(text: str) -> list[dict]:
-    """Ask Claude to extract expense items from free-form text."""
+# ─── GEMINI HELPERS ─────────────────────────────────────────────────────────
+async def gemini_request(parts: list) -> str:
+    async with httpx.AsyncClient(timeout=40) as client:
+        r = await client.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json={"contents": [{"parts": parts}]}
+        )
+    data = r.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+async def parse_text_with_gemini(text: str) -> list[dict]:
     prompt = f"""Из этого сообщения извлеки все расходы (покупки).
 Верни ТОЛЬКО валидный JSON-массив объектов без пояснений и без markdown.
 Каждый объект: {{"item": "название", "amount": число, "unit": "единица или пустая строка"}}
-unit — грамм/кг/литр/штука/пустая строка если не указано.
+unit — г/кг/мл/л/штука/пустая строка если не указано.
 amount — числовое значение (цена ИЛИ количество — то, что указано рядом с товаром).
 
 Сообщение: {text}
 
 Пример ответа: [{{"item":"апельсин","amount":500,"unit":""}},{{"item":"эклеры","amount":13,"unit":""}}]"""
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-    data = r.json()
-    raw = data["content"][0]["text"].strip()
+    raw = await gemini_request([{"text": prompt}])
     raw = re.sub(r"```json|```", "", raw).strip()
     return json.loads(raw)
 
-
-async def parse_image_with_claude(image_bytes: bytes, caption: str = "") -> list[dict]:
-    """Ask Claude Vision to extract expenses from a photo."""
+async def parse_image_with_gemini(image_bytes: bytes, caption: str = "") -> list[dict]:
     b64 = base64.standard_b64encode(image_bytes).decode()
     prompt = (
         "На этой фотографии может быть чек, упаковка продукта или список покупок. "
         "Извлеки все товары и их стоимость/количество. "
-        + (f"Дополнительный контекст от пользователя: {caption}. " if caption else "")
+        + (f"Дополнительный контекст: {caption}. " if caption else "")
         + "Верни ТОЛЬКО валидный JSON-массив объектов без пояснений и без markdown. "
         "Каждый объект: {\"item\": \"название\", \"amount\": число, \"unit\": \"г/кг/мл/л/руб/пустая\"}. "
         "Если это чек — amount это цена. Если упаковка — amount это граммовка/объём. "
         "Если ничего не нашёл — верни []."
     )
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": b64,
-                                },
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
-                    }
-                ],
-            },
-        )
-    data = r.json()
-    raw = data["content"][0]["text"].strip()
+    raw = await gemini_request([
+        {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+        {"text": prompt}
+    ])
     raw = re.sub(r"```json|```", "", raw).strip()
     return json.loads(raw)
-
 
 # ─── CHART ──────────────────────────────────────────────────────────────────
 def build_chart(daily_totals: list[tuple]) -> BytesIO:
@@ -191,7 +156,6 @@ def build_chart(daily_totals: list[tuple]) -> BytesIO:
     plt.close(fig)
     return buf
 
-
 # ─── HANDLERS ───────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -223,8 +187,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Сегодня расходов ещё нет.")
         return
 
-    # Group by item, sum amounts
-    grouped: dict[str, list] = defaultdict(list)
+    grouped: dict = defaultdict(list)
     for item, amount, unit, source in rows:
         grouped[item].append((amount, unit, source))
 
@@ -242,7 +205,6 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = f"📋 *Расходы за {today_str}*\n\n" + "\n".join(lines) + f"\n\n💰 *Итого: {total:.0f}*"
     await update.message.reply_text(text, parse_mode="Markdown")
 
-
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rows = get_daily_totals(chat_id, days=30)
@@ -259,7 +221,6 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         caption="📊 Расходы за последние дни"
     )
 
-
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text or text.startswith("/"):
@@ -267,9 +228,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     try:
-        items = await parse_text_with_claude(text)
+        items = await parse_text_with_gemini(text)
     except Exception as e:
-        log.warning(f"Claude text parse error: {e}")
+        log.warning(f"Gemini text parse error: {e}")
         await update.message.reply_text("⚠️ Не удалось разобрать сообщение. Попробуйте формат: *товар сумма*", parse_mode="Markdown")
         return
 
@@ -292,21 +253,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     caption = update.message.caption or ""
 
-    photo = update.message.photo[-1]  # highest resolution
+    photo = update.message.photo[-1]
     file = await ctx.bot.get_file(photo.file_id)
     image_bytes = await file.download_as_bytearray()
 
     processing_msg = await update.message.reply_text("🔍 Анализирую фото...")
 
     try:
-        items = await parse_image_with_claude(bytes(image_bytes), caption)
+        items = await parse_image_with_gemini(bytes(image_bytes), caption)
     except Exception as e:
-        log.warning(f"Claude image parse error: {e}")
+        log.warning(f"Gemini image parse error: {e}")
         await processing_msg.edit_text("⚠️ Не удалось распознать фото. Попробуйте написать расходы текстом.")
         return
 
@@ -332,7 +292,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await processing_msg.edit_text("🤷 Не удалось извлечь данные из фото.")
 
-
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
     init_db()
@@ -347,7 +306,6 @@ def main():
 
     log.info("Bot started. Polling...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
