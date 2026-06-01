@@ -19,7 +19,7 @@ from collections import defaultdict
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Railway автоматически задаёт эту переменную
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Railway задаёт автоматически (формат: postgresql://user:pass@host:port/db)
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -51,7 +51,11 @@ WAITING_AMOUNT = 1
 
 # ─── DATABASE ───────────────────────────────────────────────────────────────
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    url = DATABASE_URL
+    # Railway иногда даёт postgres://, psycopg2 требует postgresql://
+    if url and url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url)
 
 def init_db():
     with get_conn() as con:
