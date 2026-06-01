@@ -1,8 +1,9 @@
 import os
 import re
-import sqlite3
 import logging
-from datetime import datetime, date
+import psycopg2
+import psycopg2.extras
+from datetime import datetime, date, timedelta
 from io import BytesIO
 
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -18,7 +19,7 @@ from collections import defaultdict
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
-DB_PATH = "expenses.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Railway автоматически задаёт эту переменную
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -35,7 +36,6 @@ QUICK_ITEMS = [
     "🍺 Стаут",
 ]
 
-# Чистые имена без эмодзи для сохранения
 ITEM_NAMES = {
     "🍊 Апельсины": "Апельсины",
     "🍋 Лимон": "Лимон",
@@ -47,54 +47,62 @@ ITEM_NAMES = {
     "🍺 Стаут": "Стаут",
 }
 
-# ConversationHandler состояния
 WAITING_AMOUNT = 1
 
 # ─── DATABASE ───────────────────────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id    INTEGER NOT NULL,
-            date       TEXT    NOT NULL,
-            item       TEXT    NOT NULL,
-            amount     REAL    NOT NULL,
-            unit       TEXT    DEFAULT '',
-            source     TEXT    DEFAULT 'text',
-            created_at TEXT    DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    con.commit()
-    con.close()
+    with get_conn() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS expenses (
+                id         SERIAL PRIMARY KEY,
+                chat_id    BIGINT NOT NULL,
+                date       DATE   NOT NULL,
+                item       TEXT   NOT NULL,
+                amount     REAL   NOT NULL,
+                unit       TEXT   DEFAULT '',
+                source     TEXT   DEFAULT 'text',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.commit()
+    log.info("DB initialized")
 
 def save_expense(chat_id, item, amount, unit="", source="text"):
-    today = date.today().isoformat()
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO expenses (chat_id, date, item, amount, unit, source) VALUES (?,?,?,?,?,?)",
-        (chat_id, today, item.strip(), amount, unit.strip(), source)
-    )
-    con.commit()
-    con.close()
+    today = date.today()
+    with get_conn() as con:
+        con.execute(
+            "INSERT INTO expenses (chat_id, date, item, amount, unit, source) VALUES (%s,%s,%s,%s,%s,%s)",
+            (chat_id, today, item.strip(), amount, unit.strip(), source)
+        )
+        con.commit()
+
+def get_expenses_for_date(chat_id, target_date):
+    with get_conn() as con:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT item, amount, unit, source FROM expenses WHERE chat_id=%s AND date=%s ORDER BY id",
+            (chat_id, target_date)
+        )
+        return cur.fetchall()
 
 def get_today_expenses(chat_id):
-    today = date.today().isoformat()
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        "SELECT item, amount, unit, source FROM expenses WHERE chat_id=? AND date=? ORDER BY id",
-        (chat_id, today)
-    ).fetchall()
-    con.close()
-    return rows
+    return get_expenses_for_date(chat_id, date.today())
 
 def get_daily_totals(chat_id, days=30):
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        "SELECT date, SUM(amount) FROM expenses WHERE chat_id=? GROUP BY date ORDER BY date DESC LIMIT ?",
-        (chat_id, days)
-    ).fetchall()
-    con.close()
+    with get_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT date, SUM(amount)
+            FROM expenses
+            WHERE chat_id=%s
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT %s
+        """, (chat_id, days))
+        rows = cur.fetchall()
     return list(reversed(rows))
 
 # ─── PARSER ─────────────────────────────────────────────────────────────────
@@ -122,7 +130,7 @@ def parse_expenses(text: str) -> list[dict]:
 
 # ─── CHART ──────────────────────────────────────────────────────────────────
 def build_chart(daily_totals):
-    dates = [datetime.strptime(d, "%Y-%m-%d") for d, _ in daily_totals]
+    dates = [datetime.combine(d, datetime.min.time()) if isinstance(d, date) else datetime.strptime(str(d), "%Y-%m-%d") for d, _ in daily_totals]
     amounts = [a for _, a in daily_totals]
     fig, ax = plt.subplots(figsize=(10, 5))
     bars = ax.bar(dates, amounts, color="#4F8EF7", width=0.6, zorder=3)
@@ -168,13 +176,40 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    rows = get_today_expenses(chat_id)
+    args = ctx.args if ctx.args else []
+    arg = args[0].lower() if args else ""
+    today = date.today()
+
+    if arg in ("вчера", "yesterday", "1"):
+        target = today - timedelta(days=1)
+    elif arg == "2":
+        target = today - timedelta(days=2)
+    elif arg == "3":
+        target = today - timedelta(days=3)
+    elif re.match(r'^\d{2}\.\d{2}$', arg):
+        try:
+            target = datetime.strptime(f"{arg}.{today.year}", "%d.%m.%Y").date()
+        except:
+            target = today
+    elif re.match(r'^\d{2}\.\d{2}\.\d{4}$', arg):
+        try:
+            target = datetime.strptime(arg, "%d.%m.%Y").date()
+        except:
+            target = today
+    else:
+        target = today
+
+    rows = get_expenses_for_date(chat_id, target)
+    date_label = "сегодня" if target == today else target.strftime("%d.%m.%Y")
+
     if not rows:
-        await update.message.reply_text("📭 Сегодня расходов ещё нет.", reply_markup=main_keyboard())
+        await update.message.reply_text(f"📭 За {date_label} расходов нет.", reply_markup=main_keyboard())
         return
+
     grouped = defaultdict(list)
     for item, amount, unit, source in rows:
         grouped[item].append((amount, unit, source))
+
     lines = []
     total = 0.0
     for item, entries in grouped.items():
@@ -184,8 +219,8 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         unit_str = f" {unit}" if unit else ""
         lines.append(f"{icon} *{item}*: {s:.0f}{unit_str}")
         total += s
-    today_str = date.today().strftime("%d.%m.%Y")
-    text = f"📋 *Расходы за {today_str}*\n\n" + "\n".join(lines) + f"\n\n💰 *Итого: {total:.0f}*"
+
+    text = f"📋 *Расходы за {date_label}*\n\n" + "\n".join(lines) + f"\n\n💰 *Итого: {total:.0f}*"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -200,11 +235,10 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     buf = build_chart(rows)
     await update.message.reply_photo(photo=InputFile(buf, filename="chart.png"), caption="📊 Расходы за последние дни")
 
-# ─── CONVERSATION: кнопка → сумма ───────────────────────────────────────────
+# ─── CONVERSATION ────────────────────────────────────────────────────────────
 async def button_pressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
-    # Кнопки отчёта/диаграммы
     if text == "📋 Отчёт":
         await cmd_report(update, ctx)
         return ConversationHandler.END
@@ -212,7 +246,6 @@ async def button_pressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_chart(update, ctx)
         return ConversationHandler.END
 
-    # Кнопка товара
     if text in ITEM_NAMES:
         ctx.user_data["pending_item"] = ITEM_NAMES[text]
         await update.message.reply_text(
@@ -233,10 +266,7 @@ async def receive_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text(
-            "⚠️ Введите число, например: `500`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Введите число, например: `500`", parse_mode="Markdown")
         return WAITING_AMOUNT
 
     save_expense(update.effective_chat.id, item, amount, source="button")
@@ -302,7 +332,6 @@ def main():
     init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # ConversationHandler для кнопок
     conv = ConversationHandler(
         entry_points=[MessageHandler(
             filters.TEXT & filters.Regex('^(' + '|'.join(re.escape(k) for k in list(ITEM_NAMES.keys()) + ["📋 Отчёт", "📊 Диаграмма"]) + ')$'),
