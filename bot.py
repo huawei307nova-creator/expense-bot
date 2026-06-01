@@ -59,7 +59,8 @@ def get_conn():
 
 def init_db():
     with get_conn() as con:
-        con.execute("""
+        cur = con.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id         SERIAL PRIMARY KEY,
                 chat_id    BIGINT NOT NULL,
@@ -77,7 +78,8 @@ def init_db():
 def save_expense(chat_id, item, amount, unit="", source="text"):
     today = date.today()
     with get_conn() as con:
-        con.execute(
+        cur = con.cursor()
+        cur.execute(
             "INSERT INTO expenses (chat_id, date, item, amount, unit, source) VALUES (%s,%s,%s,%s,%s,%s)",
             (chat_id, today, item.strip(), amount, unit.strip(), source)
         )
