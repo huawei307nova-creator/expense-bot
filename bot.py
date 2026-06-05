@@ -2,7 +2,6 @@ import os
 import re
 import logging
 import psycopg2
-import psycopg2.extras
 from datetime import datetime, date, timedelta
 from io import BytesIO
 
@@ -15,36 +14,35 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import numpy as np
 from collections import defaultdict
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Railway задаёт автоматически (формат: postgresql://user:pass@host:port/db)
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ─── БЫСТРЫЕ КНОПКИ ─────────────────────────────────────────────────────────
-QUICK_ITEMS = [
-    "🍊 Апельсины",
-    "🍋 Лимон",
-    "🍍 Ананас",
-    "🍋 Лим фреш",
-    "🍊 Апельсин фреш",
-    "🍺 IPA",
-    "🍺 Шпатен",
-    "🍺 Стаут",
-]
-
+# ─── КНОПКИ (порядок как просили) ───────────────────────────────────────────
 ITEM_NAMES = {
-    "🍊 Апельсины": "Апельсины",
-    "🍋 Лимон": "Лимон",
-    "🍍 Ананас": "Ананас",
-    "🍋 Лим фреш": "Лим фреш",
-    "🍊 Апельсин фреш": "Апельсин фреш",
-    "🍺 IPA": "IPA",
-    "🍺 Шпатен": "Шпатен",
-    "🍺 Стаут": "Стаут",
+    "🫐 Морс Клюква":     "Морс Клюква приход",
+    "🫐 Морс Смородина":  "Морс Смородина приход",
+    "🫐 Морс Кизил":      "Морс Кизил приход",
+    "🍮 Эклеры приход":   "Эклеры приход",
+    "🍊 Апельсины":       "Апельсины",
+    "🍋 Лимон":           "Лимон",
+    "🍍 Ананас":          "Ананас",
+    "🥝 Киви":            "Киви",
+    "🍳 На кухню":        "На кухню",
+    "🧁 На кондитерку":   "На кондитерку",
+    "🍓 Пюре Малина":     "Пюре Малина",
+    "🥭 Пюре Манго":      "Пюре Манго",
+    "🍋 Лим фреш":        "Лим фреш",
+    "🍊 Апельсин фреш":   "Апельсин фреш",
+    "🍺 IPA":             "IPA",
+    "🍺 Шпатен":          "Шпатен",
+    "🍺 Стаут":           "Стаут",
 }
 
 WAITING_AMOUNT = 1
@@ -52,7 +50,6 @@ WAITING_AMOUNT = 1
 # ─── DATABASE ───────────────────────────────────────────────────────────────
 def get_conn():
     url = DATABASE_URL
-    # Railway иногда даёт postgres://, psycopg2 требует postgresql://
     if url and url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     return psycopg2.connect(url)
@@ -76,12 +73,11 @@ def init_db():
     log.info("DB initialized")
 
 def save_expense(chat_id, item, amount, unit="", source="text"):
-    today = date.today()
     with get_conn() as con:
         cur = con.cursor()
         cur.execute(
             "INSERT INTO expenses (chat_id, date, item, amount, unit, source) VALUES (%s,%s,%s,%s,%s,%s)",
-            (chat_id, today, item.strip(), amount, unit.strip(), source)
+            (chat_id, date.today(), item.strip(), amount, unit.strip(), source)
         )
         con.commit()
 
@@ -94,22 +90,37 @@ def get_expenses_for_date(chat_id, target_date):
         )
         return cur.fetchall()
 
-def get_today_expenses(chat_id):
-    return get_expenses_for_date(chat_id, date.today())
-
 def get_daily_totals(chat_id, days=30):
     with get_conn() as con:
         cur = con.cursor()
         cur.execute("""
-            SELECT date, SUM(amount)
-            FROM expenses
-            WHERE chat_id=%s
-            GROUP BY date
-            ORDER BY date DESC
-            LIMIT %s
+            SELECT date, SUM(amount) FROM expenses
+            WHERE chat_id=%s GROUP BY date ORDER BY date DESC LIMIT %s
         """, (chat_id, days))
-        rows = cur.fetchall()
-    return list(reversed(rows))
+        return list(reversed(cur.fetchall()))
+
+def get_week_by_item(chat_id):
+    """Возвращает расходы за последние 7 дней по каждой позиции."""
+    week_ago = date.today() - timedelta(days=6)
+    with get_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT item, SUM(amount) FROM expenses
+            WHERE chat_id=%s AND date >= %s
+            GROUP BY item ORDER BY SUM(amount) DESC
+        """, (chat_id, week_ago))
+        return cur.fetchall()
+
+def get_day_by_item(chat_id, target_date):
+    """Расходы за конкретный день по каждой позиции."""
+    with get_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT item, SUM(amount) FROM expenses
+            WHERE chat_id=%s AND date=%s
+            GROUP BY item ORDER BY SUM(amount) DESC
+        """, (chat_id, target_date))
+        return cur.fetchall()
 
 # ─── PARSER ─────────────────────────────────────────────────────────────────
 UNITS = ["кг", "г", "гр", "мл", "л", "литр", "литра", "литров", "штук", "шт", "руб", "р", "тг", "сом"]
@@ -134,19 +145,26 @@ def parse_expenses(text: str) -> list[dict]:
                 results.append({"item": item, "amount": amount, "unit": unit})
     return results
 
-# ─── CHART ──────────────────────────────────────────────────────────────────
-def build_chart(daily_totals):
-    dates = [datetime.combine(d, datetime.min.time()) if isinstance(d, date) else datetime.strptime(str(d), "%Y-%m-%d") for d, _ in daily_totals]
-    amounts = [a for _, a in daily_totals]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    bars = ax.bar(dates, amounts, color="#4F8EF7", width=0.6, zorder=3)
+# ─── CHARTS ─────────────────────────────────────────────────────────────────
+def build_day_chart(target_date: date) -> BytesIO:
+    """Столбчатая диаграмма по позициям за один день."""
+    # placeholder — данные передаются снаружи
+    pass
+
+def build_chart_day(rows, target_date: date) -> BytesIO:
+    """rows = [(item, amount), ...]"""
+    items = [r[0] for r in rows]
+    amounts = [r[1] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(items) * 0.9), 5))
+    colors = plt.cm.Set3(np.linspace(0, 1, len(items)))
+    bars = ax.bar(range(len(items)), amounts, color=colors, zorder=3)
     ax.set_facecolor("#F7F9FC")
     fig.patch.set_facecolor("#F7F9FC")
     ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
-    ax.xaxis.set_major_locator(mdates.DayLocator())
-    plt.xticks(rotation=45, ha="right", fontsize=9)
-    ax.set_title("Расходы по дням", fontsize=14, fontweight="bold", pad=12)
+    ax.set_xticks(range(len(items)))
+    ax.set_xticklabels(items, rotation=35, ha="right", fontsize=9)
+    ax.set_title(f"Расходы за {target_date.strftime('%d.%m.%Y')} по позициям", fontsize=13, fontweight="bold", pad=10)
     ax.set_ylabel("Сумма")
     for bar, val in zip(bars, amounts):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(amounts)*0.01,
@@ -158,64 +176,73 @@ def build_chart(daily_totals):
     plt.close(fig)
     return buf
 
-# ─── КЛАВИАТУРЫ ─────────────────────────────────────────────────────────────
+def build_chart_week(rows) -> BytesIO:
+    """rows = [(item, amount), ...] — топ позиций за неделю."""
+    items = [r[0] for r in rows]
+    amounts = [r[1] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(items) * 0.9), 5))
+    colors = plt.cm.Paired(np.linspace(0, 1, len(items)))
+    bars = ax.barh(range(len(items)), amounts, color=colors, zorder=3)
+    ax.set_facecolor("#F7F9FC")
+    fig.patch.set_facecolor("#F7F9FC")
+    ax.grid(axis="x", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels(items, fontsize=9)
+    ax.invert_yaxis()
+    week_ago = (date.today() - timedelta(days=6)).strftime("%d.%m")
+    today_str = date.today().strftime("%d.%m")
+    ax.set_title(f"Расходы за неделю ({week_ago}–{today_str}) по позициям", fontsize=12, fontweight="bold", pad=10)
+    ax.set_xlabel("Сумма")
+    for bar, val in zip(bars, amounts):
+        ax.text(val + max(amounts)*0.01, bar.get_y() + bar.get_height()/2,
+                f"{val:.0f}", va="center", fontsize=8)
+    plt.tight_layout()
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=130)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ─── КЛАВИАТУРА ─────────────────────────────────────────────────────────────
 def main_keyboard():
     keyboard = [
-        ["🍊 Апельсины", "🍋 Лимон", "🍍 Ананас"],
-        ["🍋 Лим фреш", "🍊 Апельсин фреш"],
-        ["🍺 IPA", "🍺 Шпатен", "🍺 Стаут"],
-        ["📋 Отчёт", "📊 Диаграмма"],
+        ["🫐 Морс Клюква",    "🫐 Морс Смородина", "🫐 Морс Кизил"],
+        ["🍮 Эклеры приход"],
+        ["🍊 Апельсины",      "🍋 Лимон",          "🍍 Ананас",     "🥝 Киви"],
+        ["🍳 На кухню",       "🧁 На кондитерку"],
+        ["🍓 Пюре Малина",    "🥭 Пюре Манго"],
+        ["🍋 Лим фреш",       "🍊 Апельсин фреш"],
+        ["🍺 IPA",            "🍺 Шпатен",         "🍺 Стаут"],
+        ["📋 Отчёт",          "📊 График за день",  "📈 График за неделю"],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ─── HANDLERS ───────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я слежу за расходами.\n\n"
-        "Нажмите кнопку товара → введите сумму.\n"
-        "Или пишите вручную: `апельсины 500, хлеб 45`\n\n"
-        "📋 /report — отчёт за сегодня\n"
-        "📊 /chart — диаграмма по дням",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
-
-async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = ctx.args if ctx.args else []
-    arg = args[0].lower() if args else ""
+# ─── HELPERS ────────────────────────────────────────────────────────────────
+def parse_date_arg(arg: str):
     today = date.today()
-
+    if not arg:
+        return today, "сегодня"
+    arg = arg.lower()
     if arg in ("вчера", "yesterday", "1"):
-        target = today - timedelta(days=1)
-    elif arg == "2":
-        target = today - timedelta(days=2)
-    elif arg == "3":
-        target = today - timedelta(days=3)
-    elif re.match(r'^\d{2}\.\d{2}$', arg):
-        try:
-            target = datetime.strptime(f"{arg}.{today.year}", "%d.%m.%Y").date()
-        except:
-            target = today
-    elif re.match(r'^\d{2}\.\d{2}\.\d{4}$', arg):
-        try:
-            target = datetime.strptime(arg, "%d.%m.%Y").date()
-        except:
-            target = today
-    else:
-        target = today
+        d = today - timedelta(days=1)
+        return d, d.strftime("%d.%m.%Y")
+    if arg == "2":
+        d = today - timedelta(days=2); return d, d.strftime("%d.%m.%Y")
+    if arg == "3":
+        d = today - timedelta(days=3); return d, d.strftime("%d.%m.%Y")
+    if re.match(r'^\d{2}\.\d{2}$', arg):
+        try: return (d := datetime.strptime(f"{arg}.{today.year}", "%d.%m.%Y").date()), d.strftime("%d.%m.%Y")
+        except: pass
+    if re.match(r'^\d{2}\.\d{2}\.\d{4}$', arg):
+        try: return (d := datetime.strptime(arg, "%d.%m.%Y").date()), d.strftime("%d.%m.%Y")
+        except: pass
+    return today, "сегодня"
 
-    rows = get_expenses_for_date(chat_id, target)
-    date_label = "сегодня" if target == today else target.strftime("%d.%m.%Y")
-
-    if not rows:
-        await update.message.reply_text(f"📭 За {date_label} расходов нет.", reply_markup=main_keyboard())
-        return
-
+def format_report(rows, date_label):
     grouped = defaultdict(list)
     for item, amount, unit, source in rows:
         grouped[item].append((amount, unit, source))
-
     lines = []
     total = 0.0
     for item, entries in grouped.items():
@@ -225,33 +252,74 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         unit_str = f" {unit}" if unit else ""
         lines.append(f"{icon} *{item}*: {s:.0f}{unit_str}")
         total += s
+    return f"📋 *Расходы за {date_label}*\n\n" + "\n".join(lines) + f"\n\n💰 *Итого: {total:.0f}*"
 
-    text = f"📋 *Расходы за {date_label}*\n\n" + "\n".join(lines) + f"\n\n💰 *Итого: {total:.0f}*"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+# ─── HANDLERS ───────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Слежу за расходами.\n\n"
+        "Нажмите кнопку → введите сумму.\n"
+        "Или пишите: `апельсины 500, хлеб 45`\n\n"
+        "📋 /report — отчёт сегодня\n"
+        "📋 /report вчера — вчера\n"
+        "📋 /report 25.05 — конкретная дата",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
+    )
 
-async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    rows = get_daily_totals(chat_id, days=30)
+    args = ctx.args if ctx.args else []
+    arg = args[0] if args else ""
+    target, label = parse_date_arg(arg)
+    rows = get_expenses_for_date(chat_id, target)
     if not rows:
-        await update.message.reply_text("📭 Данных пока нет.", reply_markup=main_keyboard())
+        await update.message.reply_text(f"📭 За {label} расходов нет.", reply_markup=main_keyboard())
         return
-    if len(rows) < 2:
-        await update.message.reply_text("📊 Нужно хотя бы 2 дня данных.", reply_markup=main_keyboard())
+    await update.message.reply_text(format_report(rows, label), parse_mode="Markdown", reply_markup=main_keyboard())
+
+async def cmd_chart_day(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    today = date.today()
+    rows = get_day_by_item(chat_id, today)
+    if not rows:
+        await update.message.reply_text("📭 Сегодня расходов нет.", reply_markup=main_keyboard())
         return
-    buf = build_chart(rows)
-    await update.message.reply_photo(photo=InputFile(buf, filename="chart.png"), caption="📊 Расходы за последние дни")
+    buf = build_chart_day(rows, today)
+    total = sum(r[1] for r in rows)
+    await update.message.reply_photo(
+        photo=InputFile(buf, filename="day.png"),
+        caption=f"📊 Расходы за {today.strftime('%d.%m.%Y')} | Итого: {total:.0f}",
+        reply_markup=main_keyboard()
+    )
+
+async def cmd_chart_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    rows = get_week_by_item(chat_id)
+    if not rows:
+        await update.message.reply_text("📭 За неделю данных нет.", reply_markup=main_keyboard())
+        return
+    buf = build_chart_week(rows)
+    total = sum(r[1] for r in rows)
+    week_ago = (date.today() - timedelta(days=6)).strftime("%d.%m")
+    today_str = date.today().strftime("%d.%m")
+    await update.message.reply_photo(
+        photo=InputFile(buf, filename="week.png"),
+        caption=f"📈 Расходы {week_ago}–{today_str} по позициям | Итого: {total:.0f}",
+        reply_markup=main_keyboard()
+    )
 
 # ─── CONVERSATION ────────────────────────────────────────────────────────────
+ALL_BUTTONS = list(ITEM_NAMES.keys()) + ["📋 Отчёт", "📊 График за день", "📈 График за неделю"]
+
 async def button_pressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-
     if text == "📋 Отчёт":
-        await cmd_report(update, ctx)
-        return ConversationHandler.END
-    if text == "📊 Диаграмма":
-        await cmd_chart(update, ctx)
-        return ConversationHandler.END
-
+        await cmd_report(update, ctx); return ConversationHandler.END
+    if text == "📊 График за день":
+        await cmd_chart_day(update, ctx); return ConversationHandler.END
+    if text == "📈 График за неделю":
+        await cmd_chart_week(update, ctx); return ConversationHandler.END
     if text in ITEM_NAMES:
         ctx.user_data["pending_item"] = ITEM_NAMES[text]
         await update.message.reply_text(
@@ -260,26 +328,21 @@ async def button_pressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove()
         )
         return WAITING_AMOUNT
-
     return ConversationHandler.END
 
 async def receive_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace(',', '.')
     item = ctx.user_data.get("pending_item", "Товар")
-
     try:
         amount = float(text)
-        if amount <= 0:
-            raise ValueError
+        if amount <= 0: raise ValueError
     except ValueError:
         await update.message.reply_text("⚠️ Введите число, например: `500`", parse_mode="Markdown")
         return WAITING_AMOUNT
-
     save_expense(update.effective_chat.id, item, amount, source="button")
     await update.message.reply_text(
         f"✅ *{item}*: {amount:.0f} — записано!",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
     ctx.user_data.pop("pending_item", None)
     return ConversationHandler.END
@@ -291,12 +354,10 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text or text.startswith("/"):
-        return
+    if not text or text.startswith("/"): return
     chat_id = update.effective_chat.id
     items = parse_expenses(text)
-    if not items:
-        return
+    if not items: return
     saved = []
     for it in items:
         save_expense(chat_id, it["item"], it["amount"], it["unit"], source="text")
@@ -305,8 +366,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if saved:
         await update.message.reply_text(
             "Записал:\n" + "\n".join(saved) + "\n\n_/report — итог за сегодня_",
-            parse_mode="Markdown",
-            reply_markup=main_keyboard()
+            parse_mode="Markdown", reply_markup=main_keyboard()
         )
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -321,16 +381,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 unit_str = f" {it['unit']}" if it["unit"] else ""
                 saved.append(f"✅ {it['item']}: {it['amount']:.0f}{unit_str}")
             if saved:
-                await update.message.reply_text(
-                    "📸 Записал:\n" + "\n".join(saved),
-                    parse_mode="Markdown",
-                    reply_markup=main_keyboard()
-                )
+                await update.message.reply_text("📸 Записал:\n" + "\n".join(saved), parse_mode="Markdown", reply_markup=main_keyboard())
                 return
     await update.message.reply_text(
-        "📸 Фото получено! Напишите подписью к фото или отдельно:\n`апельсины 150`",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        "📸 Фото получено! Напишите подписью или отдельно:\n`апельсины 150`",
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
@@ -340,19 +395,18 @@ def main():
 
     conv = ConversationHandler(
         entry_points=[MessageHandler(
-            filters.TEXT & filters.Regex('^(' + '|'.join(re.escape(k) for k in list(ITEM_NAMES.keys()) + ["📋 Отчёт", "📊 Диаграмма"]) + ')$'),
+            filters.TEXT & filters.Regex('^(' + '|'.join(re.escape(k) for k in ALL_BUTTONS) + ')$'),
             button_pressed
         )],
-        states={
-            WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
-        },
+        states={WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("chart", cmd_chart))
+    app.add_handler(CommandHandler("day", cmd_chart_day))
+    app.add_handler(CommandHandler("week", cmd_chart_week))
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
