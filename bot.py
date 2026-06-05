@@ -100,14 +100,14 @@ def get_daily_totals(chat_id, days=30):
         return list(reversed(cur.fetchall()))
 
 def get_week_by_item(chat_id):
-    """Возвращает расходы за последние 7 дней по каждой позиции."""
+    """Возвращает расходы за последние 7 дней: [(date, item, amount)]"""
     week_ago = date.today() - timedelta(days=6)
     with get_conn() as con:
         cur = con.cursor()
         cur.execute("""
-            SELECT item, SUM(amount) FROM expenses
+            SELECT date, item, SUM(amount) FROM expenses
             WHERE chat_id=%s AND date >= %s
-            GROUP BY item ORDER BY SUM(amount) DESC
+            GROUP BY date, item ORDER BY date
         """, (chat_id, week_ago))
         return cur.fetchall()
 
@@ -177,29 +177,62 @@ def build_chart_day(rows, target_date: date) -> BytesIO:
     return buf
 
 def build_chart_week(rows) -> BytesIO:
-    """rows = [(item, amount), ...] — топ позиций за неделю."""
-    items = [r[0] for r in rows]
-    amounts = [r[1] for r in rows]
+    """rows = [(date, item, amount)] — стековый график по дням."""
+    from collections import defaultdict
 
-    fig, ax = plt.subplots(figsize=(max(8, len(items) * 0.9), 5))
-    colors = plt.cm.Paired(np.linspace(0, 1, len(items)))
-    bars = ax.barh(range(len(items)), amounts, color=colors, zorder=3)
+    # Собираем структуру: day_data[date][item] = amount
+    day_data = defaultdict(lambda: defaultdict(float))
+    all_items_set = set()
+    for d, item, amount in rows:
+        day_data[d][item] += amount
+        all_items_set.add(item)
+
+    # Сортируем дни и позиции (позиции по суммарному расходу)
+    sorted_days = sorted(day_data.keys())
+    item_totals = defaultdict(float)
+    for d in sorted_days:
+        for item, amt in day_data[d].items():
+            item_totals[item] += amt
+    sorted_items = sorted(all_items_set, key=lambda x: item_totals[x], reverse=True)
+
+    day_labels = [d.strftime("%d.%m") if hasattr(d, "strftime") else str(d)[-5:] for d in sorted_days]
+
+    COLORS = [
+        "#f97b4e","#4e8ef7","#f7c948","#7c5cbf",
+        "#3bbfa0","#e05c8a","#6dbf5c","#e8b84b",
+        "#5bc4e8","#bf7c5c","#a0bf5c","#bf5c9e",
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(sorted_days) * 1.1), 5))
+    bottoms = np.zeros(len(sorted_days))
+    for i, item in enumerate(sorted_items):
+        values = np.array([day_data[d].get(item, 0) for d in sorted_days])
+        ax.bar(range(len(sorted_days)), values, bottom=bottoms,
+               label=item, color=COLORS[i % len(COLORS)], zorder=3)
+        bottoms += values
+
     ax.set_facecolor("#F7F9FC")
     fig.patch.set_facecolor("#F7F9FC")
-    ax.grid(axis="x", linestyle="--", alpha=0.5, zorder=0)
-    ax.set_yticks(range(len(items)))
-    ax.set_yticklabels(items, fontsize=9)
-    ax.invert_yaxis()
-    week_ago = (date.today() - timedelta(days=6)).strftime("%d.%m")
-    today_str = date.today().strftime("%d.%m")
-    ax.set_title(f"Расходы за неделю ({week_ago}–{today_str}) по позициям", fontsize=12, fontweight="bold", pad=10)
-    ax.set_xlabel("Сумма")
-    for bar, val in zip(bars, amounts):
-        ax.text(val + max(amounts)*0.01, bar.get_y() + bar.get_height()/2,
-                f"{val:.0f}", va="center", fontsize=8)
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    ax.set_xticks(range(len(sorted_days)))
+    ax.set_xticklabels(day_labels, fontsize=10)
+    ax.set_ylabel("Сумма")
+    week_start = day_labels[0] if day_labels else ""
+    week_end = day_labels[-1] if day_labels else ""
+    ax.set_title(f"Расходы за неделю {week_start}–{week_end}", fontsize=13, fontweight="bold", pad=10)
+
+    # Легенда снаружи справа
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8, frameon=False)
+
+    # Подписи итогов над столбиками
+    for j, total in enumerate(bottoms):
+        if total > 0:
+            ax.text(j, total + max(bottoms)*0.01, f"{total:.0f}",
+                    ha="center", va="bottom", fontsize=8, fontweight="bold")
+
     plt.tight_layout()
     buf = BytesIO()
-    plt.savefig(buf, format="png", dpi=130)
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight")
     buf.seek(0)
     plt.close(fig)
     return buf
